@@ -6,7 +6,7 @@ import lzma
 import os
 import secrets
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import IO, Callable, Dict, NamedTuple, Optional, Sequence
@@ -35,11 +35,21 @@ def get_container_env(container: Container) -> Dict[str, Optional[str]]:
     return dict(dotenv_values(stream=StringIO(env_output.decode())))
 
 
+def read_docker_secret(secret_name: str) -> Optional[str]:
+    """
+    Read the content of a Docker secret.
+    """
+    secret_path = f"/run/secrets/{secret_name}"
+    try:
+        with open(secret_path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
 def binary_exists_in_container(container: Container, binary_name: str) -> bool:
     """
-    Get all environment variables from a container.
-
-    Variables at runtime, rather than those defined in the container.
+    Check if a binary exists in the container.
     """
     exit_code, _ = container.exec_run(["which", binary_name])
     return exit_code == 0
@@ -102,13 +112,16 @@ def backup_psql(container: Container) -> str:
 def backup_mysql(container: Container) -> str:
     env = get_container_env(container)
 
-    # The mariadb container supports both
-    if "MARIADB_ROOT_PASSWORD" in env:
-        auth = "-p$MARIADB_ROOT_PASSWORD"
-    elif "MYSQL_ROOT_PASSWORD" in env:
-        auth = "-p$MYSQL_ROOT_PASSWORD"
-    else:
+    root_password = (
+        read_docker_secret("mysql_root_password")
+        or env.get("MYSQL_ROOT_PASSWORD")
+        or env.get("MARIADB_ROOT_PASSWORD")
+    )
+
+    if not root_password:
         raise ValueError(f"Unable to find MySQL root password for {container.name}")
+
+    auth = f"-p{root_password}"
 
     if binary_exists_in_container(container, "mariadb-dump"):
         backup_binary = "mariadb-dump"
@@ -125,23 +138,23 @@ def backup_redis(container: Container) -> str:
     """
     return "sh -c 'redis-cli SAVE > /dev/null && cat /data/dump.rdb'"
 
-
 BACKUP_PROVIDERS: list[BackupProvider] = [
     BackupProvider(
-        patterns=["postgres", "tensorchord/pgvecto-rs", "nextcloud/aio-postgresql"],
+        patterns=["*psql*", "postgres", "tensorchord/pgvector-rs", "nextcloud/aio-postgresql"],
         backup_method=backup_psql,
         file_extension="sql",
     ),
     BackupProvider(
-        patterns=["mysql", "mariadb", "*/linuxserver/mariadb"],
+        patterns=["mysql", "mariadb", "*/linuxserver/mariadb", "mariadb*"],
         backup_method=backup_mysql,
         file_extension="sql",
     ),
     BackupProvider(
-        patterns=["redis"], backup_method=backup_redis, file_extension="rdb"
+        patterns=["redis", "redis*"],
+        backup_method=backup_redis,
+        file_extension="rdb"
     ),
 ]
-
 
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/var/backups"))
 SCHEDULE = os.environ.get("SCHEDULE", "0 0 * * *")
@@ -149,14 +162,34 @@ SHOW_PROGRESS = sys.stdout.isatty()
 COMPRESSION = os.environ.get("COMPRESSION", "plain")
 INCLUDE_LOGS = bool(os.environ.get("INCLUDE_LOGS"))
 
+# New environment variables
+MAX_BACKUPS = int(os.environ.get("MAX_BACKUPS", "7"))
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "14"))
 
-def get_backup_provider(container_names: Sequence[str]) -> Optional[BackupProvider]:
-    for name in container_names:
-        for provider in BACKUP_PROVIDERS:
-            if any(fnmatch.fnmatch(name, pattern) for pattern in provider.patterns):
-                return provider
 
+def get_backup_provider(container_name: str) -> Optional[BackupProvider]:
+    for provider in BACKUP_PROVIDERS:
+        if any(fnmatch.fnmatch(container_name, pattern) for pattern in provider.patterns):
+            return provider
     return None
+
+
+def delete_old_backups(container_name: str, extension: str) -> None:
+    """
+    Delete backups for a container, keeping only the last MAX_BACKUPS
+    or deleting backups older than MAX_AGE_DAYS.
+    """
+    backups = sorted(
+        BACKUP_DIR.glob(f"{container_name}*.{extension}"),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for backup in backups[MAX_BACKUPS:]:
+        os.remove(backup)
+    cutoff_time = datetime.now() - timedelta(days=MAX_AGE_DAYS)
+    for backup in backups:
+        if datetime.fromtimestamp(os.path.getmtime(backup)) < cutoff_time:
+            os.remove(backup)
 
 
 @pycron.cron(SCHEDULE)
@@ -165,10 +198,11 @@ def backup(now: datetime) -> None:
 
     backed_up_containers = []
 
-    for container in docker_client.containers.list():
-        container_names = [tag.rsplit(":", 1)[0] for tag in container.image.tags]
-        backup_provider = get_backup_provider(container_names)
+    for container in docker_client.containers.list(filters={"status": "running"}):
+        print(f"Evaluating container: {container.name}")
+        backup_provider = get_backup_provider(container.name)
         if backup_provider is None:
+            print(f"No backup provider for container: {container.name}")
             continue
 
         backup_file = (
@@ -195,6 +229,8 @@ def backup(now: datetime) -> None:
                     f.write(stdout)
 
         os.replace(backup_temp_file_path, backup_file)
+
+        delete_old_backups(container.name, backup_provider.file_extension)
 
         if not SHOW_PROGRESS:
             print(container.name)
