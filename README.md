@@ -4,6 +4,9 @@
 
 A script to automatically back up all databases running under docker on a host, with optional compression support.
 
+Added backup rotation, docker secret support for Mariadb
+For swarm, deploy as global. 
+
 ## Supported databases
 
 - MariaDB
